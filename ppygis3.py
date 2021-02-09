@@ -102,6 +102,12 @@ class _EWKBWriter(object):
             type = 6
         elif isinstance(geometry, GeometryCollection):
             type = 7
+        elif isinstance(geometry, CircularString):
+            type = 8
+        elif isinstance(geometry, CompoundCurve):
+            type = 9
+        elif isinstance(geometry, CurvePolygon):
+            type = 10
         else:
             raise Exception('unsupported geometry class <{0}>'
                             .format(geometry.__class__.__name__))
