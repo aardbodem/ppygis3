@@ -75,6 +75,10 @@ class _EWKBReader(object):
             return CompoundCurve._read_ewkb_body(self, srid)
         elif type == 10:
             return CurvePolygon._read_ewkb_body(self, srid)
+        elif type == 11:
+            return MultiCurve._read_ewkb_body(self, srid)
+        elif type == 12:
+            return MultiSurface._read_ewkb_body(self, srid)
         else:
             raise Exception('unsupported geometry type {0}'.format(type))
 
@@ -108,6 +112,10 @@ class _EWKBWriter(object):
             type = 9
         elif isinstance(geometry, CurvePolygon):
             type = 10
+        elif isinstance(geometry, MultiCurve):
+            type = 11
+        elif isinstance(geometry, MultiSurface):
+            type = 12
         else:
             raise Exception('unsupported geometry class <{0}>'
                             .format(geometry.__class__.__name__))
@@ -424,7 +432,7 @@ class MultiPolygon(GeometryCollection):
 
 """
   The CIRCULARSTRING is the basic curve type, similar to a LINESTRING in the linear world. A single segment required three points, the start and end points (first and third) and any other point on the arc. The exception to this is for a closed circle, where the start and end points are the same. In this case the second point MUST be the center of the arc, ie the opposite side of the circle. To chain arcs together, the last point of the previous arc becomes the first point of the next arc, just like in LINESTRING. This means that a valid circular string must have an odd number of points greated than 1.
-  (van http://www.postgis.net/docs/manual-1.5/ch04.html#SQL_MM_Part3)
+  (from http://www.postgis.net/docs/manual-1.5/ch04.html#SQL_MM_Part3)
 """
 class CircularString(Geometry):
     def __init__(self, points, srid=None):
@@ -535,4 +543,82 @@ class CurvePolygon(GeometryCollection):
 
     def __str__(self):
         return 'CurvePolygon(' + ', '.join([str(polygon) for polygon in
+                                            self.polygons]) + self._str_srid() + ')'
+
+"""
+  The MULTICURVE is a collection of curves, which can include linear strings, circular strings or compound strings.
+"""
+class MultiCurve(GeometryCollection):
+    def __init__(self, polygons, srid=None):
+        self.polygons = list(polygons)
+        if srid:
+            self.srid = srid
+
+    @property
+    def has_z(self):
+        return self.polygons[0].has_z
+
+    @property
+    def has_m(self):
+        return self.polygons[0].has_m
+
+    @classmethod
+    def _read_ewkb_body(cls, reader, srid=None):
+        polygons = []
+        for index in range(reader.read_int()):
+            child = reader.child_reader().read_geometry()
+            if not (isinstance(child, CircularString) or isinstance(child, LineString) or isinstance(child, CompoundCurve)):
+                raise Exception('invalid geometry ({})'.format(child))
+            polygons.append(child)
+        return cls(polygons, srid)
+
+    def _write_ewkb_body(self, writer):
+        writer.write_int(len(self.polygons))
+        for polygon in self.polygons:
+            if isinstance(polygon, CircularString) or isinstance(polygon, LineString) or isinstance(child, CompoundCurve):
+                polygon._write_ewkb(writer)
+            else:
+                raise Exception('invalid geometry')
+
+    def __str__(self):
+        return 'MultiCurve(' + ', '.join([str(polygon) for polygon in
+                                            self.polygons]) + self._str_srid() + ')'
+
+"""
+  This is a collection of surfaces, which can be (linear) polygons or curve polygons.
+"""
+class MultiSurface(GeometryCollection):
+    def __init__(self, polygons, srid=None):
+        self.polygons = list(polygons)
+        if srid:
+            self.srid = srid
+
+    @property
+    def has_z(self):
+        return self.polygons[0].has_z
+
+    @property
+    def has_m(self):
+        return self.polygons[0].has_m
+
+    @classmethod
+    def _read_ewkb_body(cls, reader, srid=None):
+        polygons = []
+        for index in range(reader.read_int()):
+            child = reader.child_reader().read_geometry()
+            if not (isinstance(child, CurvePolygon) or isinstance(child, Polygon)): # or isinstance(child, MultiPolygon)):
+                raise Exception('invalid geometry ({})'.format(child))
+            polygons.append(child)
+        return cls(polygons, srid)
+
+    def _write_ewkb_body(self, writer):
+        writer.write_int(len(self.polygons))
+        for polygon in self.polygons:
+            if isinstance(polygon, CurvePolygon) or isinstance(polygon, Polygon): # or isinstance(child, MultiPolygon):
+                polygon._write_ewkb(writer)
+            else:
+                raise Exception('invalid geometry')
+
+    def __str__(self):
+        return 'MultiSurface(' + ', '.join([str(polygon) for polygon in
                                             self.polygons]) + self._str_srid() + ')'
