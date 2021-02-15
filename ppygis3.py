@@ -104,8 +104,6 @@ class _EWKBWriter(object):
             type = 5
         elif isinstance(geometry, MultiPolygon):
             type = 6
-        elif isinstance(geometry, GeometryCollection):
-            type = 7
         elif isinstance(geometry, CircularString):
             type = 8
         elif isinstance(geometry, CompoundCurve):
@@ -116,6 +114,8 @@ class _EWKBWriter(object):
             type = 11
         elif isinstance(geometry, MultiSurface):
             type = 12
+        elif isinstance(geometry, GeometryCollection):
+            type = 7 # must come last because of inheritance
         else:
             raise Exception('unsupported geometry class <{0}>'
                             .format(geometry.__class__.__name__))
@@ -178,6 +178,9 @@ class Geometry(object):
 
     def _str_srid(self):
         return ', SRID: {0}'.format(self.srid) if self.has_srid else ''
+    
+    def points(self):
+        return []
 
 
 GEOMETRY = psycopg2.extensions.new_type((991310,), "GEOMETRY", Geometry.read_ewkb)
@@ -226,20 +229,22 @@ class Point(Geometry):
                (', M: {0}'.format(self.m) if self.has_m else '') + \
                self._str_srid() + ')'
 
+    def points(self):
+        return [(self.x, self.y)]
 
 class LineString(Geometry):
-    def __init__(self, points, srid=None):
-        self.points = list(points)
+    def __init__(self, geometries, srid=None):
+        self.geometries = list(geometries)
         if srid:
             self.srid = srid
 
     @property
     def has_z(self):
-        return self.points[0].has_z
+        return self.geometries[0].has_z
 
     @property
     def has_m(self):
-        return self.points[0].has_m
+        return self.geometries[0].has_m
 
     @classmethod
     def _read_ewkb_body(cls, reader, srid=None):
@@ -247,17 +252,22 @@ class LineString(Geometry):
                     range(reader.read_int())], srid)
 
     def _write_ewkb_body(self, writer):
-        writer.write_int(len(self.points))
-        for point in self.points:
-            if isinstance(point, Point):
-                point._write_ewkb_body(writer)
+        writer.write_int(len(self.geometries))
+        for geometry in self.geometries:
+            if isinstance(geometry, Point):
+                geometry._write_ewkb_body(writer)
             else:
                 raise Exception('invalid geometry')
 
     def __str__(self):
-        return 'LineString(' + ', '.join([str(point) for point in
-                                          self.points]) + self._str_srid() + ')'
+        return 'LineString(' + ', '.join([str(geometry) for geometry in
+                                          self.geometries]) + self._str_srid() + ')'
 
+    def points(self):
+        p = []
+        for geometry in self.geometries:
+            p.extend(geometry.points())
+        return p
 
 class Polygon(Geometry):
     def __init__(self, rings, srid=None):
@@ -290,8 +300,67 @@ class Polygon(Geometry):
         return 'Polygon(' + ', '.join([str(ring) for ring in self.rings]) + \
                self._str_srid() + ')'
 
+    def points(self):
+        p = []
+        for geometry in self.rings:
+            p.extend(geometry.points())
+        return p
 
 class GeometryCollection(Geometry):
+
+    # no attribute allowedGeometries here because all types are allowable
+
+    def __init__(self, geometries, srid=None):
+        self.geometries = list(geometries)
+        if srid:
+            self.srid = srid
+
+    @classmethod
+    def isAllowableGeometry(cls, geometry):
+        return (not hasattr(cls, 'allowedGeometries')) or isinstance(geometry, cls.allowedGeometries)
+
+    @property
+    def has_z(self):
+        return self.geometries[0].has_z
+
+    @property
+    def has_m(self):
+        return self.geometries[0].has_m
+
+    @classmethod
+    def _read_ewkb_body(cls, reader, srid=None):
+        geometries = []
+        for index in range(reader.read_int()):
+            child = reader.child_reader().read_geometry()
+            if not cls.isAllowableGeometry(child):
+                raise Exception('invalid geometry: {}'.format(child))
+            geometries.append(child)
+        return cls(geometries, srid)
+
+    def _write_ewkb_body(self, writer):
+        writer.write_int(len(self.geometries))
+        for geometry in self.geometries:
+            cls = type(self)
+            if cls.isAllowableGeometry(geometry):
+                geometry._write_ewkb(writer)
+            else:
+                raise Exception('class {} contains invalid geometry: {}'.format(cls.__name__, geometry))
+
+    def __str__(self):
+        return 'GeometryCollection(' + ', '.join([str(geometry) for geometry in
+                                                  self.geometries]) + self._str_srid() + ')'
+
+    def points(self):
+        p = []
+        for geometry in self.geometries:
+            p.extend(geometry.points())
+        return p
+
+
+class MultiPoint(GeometryCollection):
+
+    allowedGeometries = (Point,)
+
     def __init__(self, geometries, srid=None):
         self.geometries = list(geometries)
         if srid:
@@ -307,46 +376,17 @@ class GeometryCollection(Geometry):
 
     @classmethod
     def _read_ewkb_body(cls, reader, srid=None):
-        return cls([reader.child_reader().read_geometry() for index in
-                    range(reader.read_int())], srid)
-
-    def _write_ewkb_body(self, writer):
-        writer.write_int(len(self.geometries))
-        for geometry in self.geometries:
-            geometry._write_ewkb(writer)
-
-    def __str__(self):
-        return 'GeometryCollection(' + ', '.join([str(geometry) for geometry in
-                                                  self.geometries]) + self._str_srid() + ')'
-
-
-class MultiPoint(GeometryCollection):
-    def __init__(self, points, srid=None):
-        self.points = list(points)
-        if srid:
-            self.srid = srid
-
-    @property
-    def has_z(self):
-        return self.points[0].has_z
-
-    @property
-    def has_m(self):
-        return self.points[0].has_m
-
-    @classmethod
-    def _read_ewkb_body(cls, reader, srid=None):
-        points = []
+        geometries = []
         for index in range(reader.read_int()):
             child = reader.child_reader().read_geometry()
             if not isinstance(child, Point):
                 raise Exception('invalid geometry')
-            points.append(child)
-        return cls(points, srid)
+            geometries.append(child)
+        return cls(geometries, srid)
 
     def _write_ewkb_body(self, writer):
-        writer.write_int(len(self.points))
-        for point in self.points:
+        writer.write_int(len(self.geometries))
+        for point in self.geometries:
             if isinstance(point, Point):
                 point._write_ewkb(writer)
             else:
@@ -354,7 +394,7 @@ class MultiPoint(GeometryCollection):
 
     def __str__(self):
         return 'MultiPoint(' + ', '.join([str(point) for point in
-                                          self.points]) + self._str_srid() + ')'
+                                          self.geometries]) + self._str_srid() + ')'
 
 
 class MultiLineString(GeometryCollection):
@@ -430,23 +470,32 @@ class MultiPolygon(GeometryCollection):
         return 'MultiPolygon(' + ', '.join([str(polygon) for polygon in
                                             self.polygons]) + self._str_srid() + ')'
 
+    def __len__(self):
+        return len(self.polygons)
+        
+    def points(self):
+        p = []
+        for geometry in self.polygons:
+            p.extend(geometry.points())
+        return p
+
 """
   The CIRCULARSTRING is the basic curve type, similar to a LINESTRING in the linear world. A single segment required three points, the start and end points (first and third) and any other point on the arc. The exception to this is for a closed circle, where the start and end points are the same. In this case the second point MUST be the center of the arc, ie the opposite side of the circle. To chain arcs together, the last point of the previous arc becomes the first point of the next arc, just like in LINESTRING. This means that a valid circular string must have an odd number of points greated than 1.
   (from http://www.postgis.net/docs/manual-1.5/ch04.html#SQL_MM_Part3)
 """
 class CircularString(Geometry):
-    def __init__(self, points, srid=None):
-        self.points = list(points)
+    def __init__(self, geometries, srid=None):
+        self.geometries = list(geometries)
         if srid:
             self.srid = srid
 
     @property
     def has_z(self):
-        return self.points[0].has_z
+        return self.geometries[0].has_z
 
     @property
     def has_m(self):
-        return self.points[0].has_m
+        return self.geometries[0].has_m
 
     @classmethod
     def _read_ewkb_body(cls, reader, srid=None):
@@ -454,8 +503,8 @@ class CircularString(Geometry):
                     range(reader.read_int())], srid)
 
     def _write_ewkb_body(self, writer):
-        writer.write_int(len(self.points))
-        for point in self.points:
+        writer.write_int(len(self.geometries))
+        for point in self.geometries:
             if isinstance(point, Point):
                 point._write_ewkb_body(writer)
             else:
@@ -463,46 +512,30 @@ class CircularString(Geometry):
 
     def __str__(self):
         return 'CircularString(' + ', '.join([str(point) for point in
-                                          self.points]) + self._str_srid() + ')'
+                                          self.geometries]) + self._str_srid() + ')'
+
+    def points(self):
+        p = []
+        for geometry in self.geometries:
+            p.extend(geometry.points())
+        return p
 
 """
   A compound curve is a single, continuous curve that has both curved (circular) segments and linear segments. That means that in addition to having well-formed components, the end point of every component (except the last) must be coincident with the start point of the following component.
 """
 class CompoundCurve(GeometryCollection):
-    def __init__(self, lines, srid=None):
-        self.lines = list(lines)
+
+    allowedGeometries = (LineString, CircularString)
+
+    def __init__(self, geometries, srid=None):
+        self.geometries = list(geometries)
         if srid:
             self.srid = srid
 
-    @property
-    def has_z(self):
-        return self.lines[0].has_z
-
-    @property
-    def has_m(self):
-        return self.lines[0].has_m
-
-    @classmethod
-    def _read_ewkb_body(cls, reader, srid=None):
-        lines = []
-        for index in range(reader.read_int()):
-            child = reader.child_reader().read_geometry()
-            if not (isinstance(child, LineString) or isinstance(child, CircularString)):
-                raise Exception('invalid geometry ({})'.format(child))
-            lines.append(child)
-        return cls(lines, srid)
-
-    def _write_ewkb_body(self, writer):
-        writer.write_int(len(self.lines))
-        for line in self.lines:
-            if isinstance(line, LineString) or isinstance(line, CircularString):
-                line._write_ewkb(writer)
-            else:
-                raise Exception('invalid geometry')
-
     def __str__(self):
-        return 'CompoundCurve(' + ', '.join([str(line) for line in
-                                               self.lines]) + self._str_srid() + ')'
+        return 'CompoundCurve(' + ', '.join([str(geometry) for geometry in
+                                               self.geometries]) + self._str_srid() + ')'
+
 
 """
   A CURVEPOLYGON is just like a polygon, with an outer ring and zero or more inner rings. The difference is that a ring can take the form of a circular string, linear string or compound string.
@@ -510,115 +543,48 @@ class CompoundCurve(GeometryCollection):
   As of PostGIS 1.4 PostGIS supports compound curves in a curve polygon.
 """
 class CurvePolygon(GeometryCollection):
-    def __init__(self, polygons, srid=None):
-        self.polygons = list(polygons)
+
+    allowedGeometries = (CircularString, LineString, CompoundCurve)
+    
+    def __init__(self, geometries, srid=None):
+        self.geometries = list(geometries)
         if srid:
             self.srid = srid
 
-    @property
-    def has_z(self):
-        return self.polygons[0].has_z
-
-    @property
-    def has_m(self):
-        return self.polygons[0].has_m
-
-    @classmethod
-    def _read_ewkb_body(cls, reader, srid=None):
-        polygons = []
-        for index in range(reader.read_int()):
-            child = reader.child_reader().read_geometry()
-            if not (isinstance(child, CircularString) or isinstance(child, LineString) or isinstance(child, CompoundCurve)):
-                raise Exception('invalid geometry ({})'.format(child))
-            polygons.append(child)
-        return cls(polygons, srid)
-
-    def _write_ewkb_body(self, writer):
-        writer.write_int(len(self.polygons))
-        for polygon in self.polygons:
-            if isinstance(polygon, CircularString) or isinstance(polygon, LineString) or isinstance(child, CompoundCurve):
-                polygon._write_ewkb(writer)
-            else:
-                raise Exception('invalid geometry')
-
     def __str__(self):
-        return 'CurvePolygon(' + ', '.join([str(polygon) for polygon in
-                                            self.polygons]) + self._str_srid() + ')'
+        return 'CurvePolygon(' + ', '.join([str(geometry) for geometry in
+                                            self.geometries]) + self._str_srid() + ')'
+
 
 """
   The MULTICURVE is a collection of curves, which can include linear strings, circular strings or compound strings.
 """
 class MultiCurve(GeometryCollection):
-    def __init__(self, polygons, srid=None):
-        self.polygons = list(polygons)
+
+    allowedGeometries = (CircularString, LineString, CompoundCurve)
+
+    def __init__(self, geometries, srid=None):
+        self.geometries = list(geometries)
         if srid:
             self.srid = srid
 
-    @property
-    def has_z(self):
-        return self.polygons[0].has_z
-
-    @property
-    def has_m(self):
-        return self.polygons[0].has_m
-
-    @classmethod
-    def _read_ewkb_body(cls, reader, srid=None):
-        polygons = []
-        for index in range(reader.read_int()):
-            child = reader.child_reader().read_geometry()
-            if not (isinstance(child, CircularString) or isinstance(child, LineString) or isinstance(child, CompoundCurve)):
-                raise Exception('invalid geometry ({})'.format(child))
-            polygons.append(child)
-        return cls(polygons, srid)
-
-    def _write_ewkb_body(self, writer):
-        writer.write_int(len(self.polygons))
-        for polygon in self.polygons:
-            if isinstance(polygon, CircularString) or isinstance(polygon, LineString) or isinstance(child, CompoundCurve):
-                polygon._write_ewkb(writer)
-            else:
-                raise Exception('invalid geometry')
-
     def __str__(self):
-        return 'MultiCurve(' + ', '.join([str(polygon) for polygon in
-                                            self.polygons]) + self._str_srid() + ')'
+        return 'MultiCurve(' + ', '.join([str(geometry) for geometry in
+                                            self.geometries]) + self._str_srid() + ')'
+
 
 """
   This is a collection of surfaces, which can be (linear) polygons or curve polygons.
 """
 class MultiSurface(GeometryCollection):
-    def __init__(self, polygons, srid=None):
-        self.polygons = list(polygons)
+
+    allowedGeometries = (Polygon, CurvePolygon) # + MultiPolygon?
+    
+    def __init__(self, geometries, srid=None):
+        self.geometries = list(geometries)
         if srid:
             self.srid = srid
 
-    @property
-    def has_z(self):
-        return self.polygons[0].has_z
-
-    @property
-    def has_m(self):
-        return self.polygons[0].has_m
-
-    @classmethod
-    def _read_ewkb_body(cls, reader, srid=None):
-        polygons = []
-        for index in range(reader.read_int()):
-            child = reader.child_reader().read_geometry()
-            if not (isinstance(child, CurvePolygon) or isinstance(child, Polygon)): # or isinstance(child, MultiPolygon)):
-                raise Exception('invalid geometry ({})'.format(child))
-            polygons.append(child)
-        return cls(polygons, srid)
-
-    def _write_ewkb_body(self, writer):
-        writer.write_int(len(self.polygons))
-        for polygon in self.polygons:
-            if isinstance(polygon, CurvePolygon) or isinstance(polygon, Polygon): # or isinstance(child, MultiPolygon):
-                polygon._write_ewkb(writer)
-            else:
-                raise Exception('invalid geometry')
-
     def __str__(self):
-        return 'MultiSurface(' + ', '.join([str(polygon) for polygon in
-                                            self.polygons]) + self._str_srid() + ')'
+        return 'MultiSurface(' + ', '.join([str(geometry) for geometry in
+                                            self.geometries]) + self._str_srid() + ')'
